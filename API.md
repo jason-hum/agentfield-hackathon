@@ -1,11 +1,12 @@
 # IBKR Paper Trading API
 
-This project exposes two APIs:
+This project now has a **single recommended integration API**:
 
-1. In-process Python API (recommended for backend integration in the same deployable artifact)
-2. CLI API (JSON over stdout)
+- `execute_trade(payload) -> TradeResult`
 
-The CLI is now a thin wrapper around the in-process API, so behavior is consistent.
+It performs validation, order construction, submission, and optional wait-for-terminal in one call.
+
+Lower-level functions still exist in `src/service_api.py`, but backend integrations should normally call `execute_trade` only.
 
 ## 1) Quick Start
 
@@ -15,118 +16,182 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Create env file:
+Configure env:
 
 ```bash
 cp .env.example .env
 ```
 
-Set values in `.env`:
-
+`.env` values:
 - `IB_HOST` default `127.0.0.1`
 - `IB_PORT` default `7497` (TWS paper)
 - `IB_CLIENT_ID` default `7`
 - `ORDER_DB_PATH` default `data/orders.db`
 
-Smoke test:
+## 2) Single In-Process API
 
-```bash
-python -m src.app health
-```
+Module: `src/trade_api.py`
 
-## 2) In-Process API (Primary)
+Top-level exports from `src`:
+- `TradeRequest`
+- `execute_trade`
+- `TradeResult`
 
-Module: `src/service_api.py`
-
-Exports (also re-exported by `src/__init__.py`):
-
-- Inputs: `HealthIn`, `ValidateIn`, `PlaceIn`, `WatchIn`
-- Outputs: `HealthOut`, `ValidateOut`, `PlaceOut`, `WatchOut`
-- Functions: `run_health`, `run_validate`, `run_place`, `run_watch`
-
-### 2.1 Type Signatures
+### 2.1 Signature
 
 ```python
-run_health(payload: HealthIn, *, config: Config | None = None, logger: logging.Logger | None = None) -> HealthOut
-run_validate(payload: ValidateIn) -> ValidateOut
-run_place(payload: PlaceIn, *, config: Config | None = None, logger: logging.Logger | None = None) -> PlaceOut
-run_watch(payload: WatchIn, *, config: Config | None = None, logger: logging.Logger | None = None, on_update: Callable[[dict], None] | None = None) -> WatchOut
+execute_trade(
+    payload: dict | TradeRequest,
+    *,
+    config: Config | None = None,
+    logger: logging.Logger | None = None,
+    on_update: Callable[[dict], None] | None = None,
+) -> TradeResult
 ```
 
-### 2.2 Input Models
+### 2.2 Trade Payload
 
-`HealthIn`
-- `timeout: float = 5.0`
+```python
+{
+  "order": {...},
+  "transmit": false,
+  "dry_run": false,
+  "wait_for_terminal": false,
+  "timeout": 5.0,
+  "poll_interval": 1.0,
+  "max_wait": null
+}
+```
 
-`ValidateIn`
-- `order: OrderInput`
-- `transmit: bool = False`
-
-`PlaceIn`
-- `order: OrderInput`
-- `transmit: bool = False`
-- `dry_run: bool = False`
-- `timeout: float = 5.0`
-
-`WatchIn`
-- `order_id: int`
-- `poll_interval: float = 1.0`
-- `timeout: float = 5.0`
-- `max_wait: float | None = None`
-
-`OrderInput` accepted forms:
-- `OrderRequest` object
-- Python `dict`
+`order` accepted shapes:
+- `dict`
 - JSON `str`
+- `OrderRequest` object (internal/advanced use)
 
-### 2.3 Output Models
+Behavior:
+- `dry_run=True`: validates and builds order/contract, no submission.
+- `wait_for_terminal=True`: after submit, waits for terminal status (`FILLED`, `CANCELLED`, etc.).
+- `transmit=False` by default for safety.
 
-`HealthOut`
-- `connected: bool`
-- `next_valid_id: int | None`
-- `error: str | None`
+### 2.3 TradeResult
 
-`ValidateOut`
-- `valid: bool`
-- `order_request: dict | None`
-- `effective_order_ref: str | None`
-- `errors: list[dict] | None`
+```python
+@dataclass(frozen=True)
+class TradeResult:
+    ok: bool
+    submitted: bool = False
+    dry_run: bool = False
+    order_id: int | None = None
+    status: str | None = None
+    terminal: bool | None = None
+    state: dict | None = None
+    updates: list[dict] | None = None
+    contract: dict | None = None
+    order_payload: dict | None = None
+    order_request: dict | None = None
+    effective_order_ref: str | None = None
+    errors: list[dict] | None = None
+    error: str | None = None
+```
 
-`PlaceOut`
-- `submitted: bool`
-- `dry_run: bool`
-- `order_id: int | None`
-- `state: dict | None` (latest order state when submitted)
-- `contract: dict | None` (constructed IB contract)
-- `order_payload: dict | None` (constructed IB order)
-- `order_request: dict | None` (only used in dry-run)
-- `effective_order_ref: str | None` (only used in dry-run)
-- `errors: list[dict] | None`
-- `error: str | None`
+Interpretation:
+- `ok=True` means the requested workflow completed successfully.
+- `submitted=True` means order submission was attempted and accepted by client path.
+- `dry_run=True` means no network submission happened.
+- `errors` is validation/runtime structured detail.
+- `error` is top-level operation error (connect failure, watch timeout, etc).
 
-`WatchOut`
-- `order_id: int`
-- `terminal: bool`
-- `status: str | None`
-- `updates: list[dict] | None`
-- `error: str | None`
+## 3) Backend Integration Examples
 
-### 2.4 Order Request Schema
+### 3.1 Minimal Submit
 
-`OrderRequest` fields (from `src/domain/order_request.py`):
+```python
+from src import execute_trade
+
+result = execute_trade(
+    {
+        "order": {
+            "action": "BUY",
+            "symbol": "AAPL",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+        "transmit": False,
+    }
+)
+
+if not result.ok:
+    print(result.error, result.errors)
+else:
+    print(result.order_id, result.status)
+```
+
+### 3.2 Dry Run (No Submission)
+
+```python
+from src import execute_trade
+
+result = execute_trade(
+    {
+        "order": {
+            "action": "SELL",
+            "symbol": "MSFT",
+            "order_type": "LMT",
+            "quantity": 2,
+            "limit_price": 450.0,
+        },
+        "dry_run": True,
+    }
+)
+
+print(result.ok, result.dry_run)
+print(result.contract)
+print(result.order_payload)
+```
+
+### 3.3 Submit + Wait for Terminal
+
+```python
+from src import execute_trade
+
+
+def on_update(event: dict) -> None:
+    print("update", event)
+
+
+result = execute_trade(
+    {
+        "order": {
+            "action": "BUY",
+            "symbol": "AAPL",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+        "wait_for_terminal": True,
+        "max_wait": 120,
+    },
+    on_update=on_update,
+)
+
+print(result.ok, result.terminal, result.status, result.error)
+```
+
+## 4) Order Schema
+
+`OrderRequest` is defined in `src/domain/order_request.py`.
 
 Required:
 - `action`: `"BUY" | "SELL"`
-- `symbol`: non-empty string (normalized uppercase)
+- `symbol`: non-empty string
 - `order_type`: `"MKT" | "LMT"`
 - `quantity`: positive number
 
 Defaults:
-- `sec_type`: `"STK"`
-- `exchange`: `"SMART"`
-- `currency`: `"USD"`
-- `tif`: `"DAY"`
-- `transmit`: `False`
+- `sec_type="STK"`
+- `exchange="SMART"`
+- `currency="USD"`
+- `tif="DAY"`
+- `transmit=False`
 
 Conditional:
 - `limit_price` required for `LMT`
@@ -137,197 +202,48 @@ Optional:
 - `client_tag`
 - `order_ref`
 
-Validation notes:
-- Extra fields are rejected.
-- String enums are uppercased.
-- `client_tag` and `order_ref` must match when both provided.
+Validation behavior:
+- Unknown fields rejected.
+- Enum-like strings normalized uppercase.
+- If both `client_tag` and `order_ref` are set, they must match.
 
-### 2.5 In-Process Usage Examples
+## 5) CLI API (Secondary)
 
-Validate:
-
-```python
-from src.service_api import ValidateIn, run_validate
-
-out = run_validate(
-    ValidateIn(order={
-        "action": "BUY",
-        "symbol": "AAPL",
-        "order_type": "MKT",
-        "quantity": 1
-    })
-)
-
-if not out.valid:
-    print(out.errors)
-```
-
-Place (dry run):
-
-```python
-from src.service_api import PlaceIn, run_place
-
-out = run_place(
-    PlaceIn(
-        order={
-            "action": "SELL",
-            "symbol": "MSFT",
-            "order_type": "LMT",
-            "quantity": 2,
-            "limit_price": 450.0
-        },
-        dry_run=True
-    )
-)
-
-print(out.contract)
-print(out.order_payload)
-```
-
-Place + watch:
-
-```python
-from src.service_api import PlaceIn, WatchIn, run_place, run_watch
-
-place_out = run_place(
-    PlaceIn(
-        order={
-            "action": "BUY",
-            "symbol": "AAPL",
-            "order_type": "MKT",
-            "quantity": 1
-        },
-        transmit=False
-    )
-)
-
-if place_out.submitted and place_out.order_id is not None:
-    def on_update(event: dict) -> None:
-        print(event)
-
-    watch_out = run_watch(
-        WatchIn(order_id=place_out.order_id, poll_interval=1.0, max_wait=120),
-        on_update=on_update,
-    )
-
-    print(watch_out.terminal, watch_out.status, watch_out.error)
-```
-
-## 3) CLI API
-
-Entry point: `python -m src.app`
-
-All commands return JSON to stdout and non-zero exit code on failure.
-
-### 3.1 Commands
-
-Health:
+CLI remains available for scripts and manual ops:
 
 ```bash
-python -m src.app health --timeout 5
-```
-
-Validate:
-
-```bash
-python -m src.app validate --json '{"action":"BUY","symbol":"AAPL","order_type":"MKT","quantity":1}'
+python -m src.app health
 python -m src.app validate --json-file examples/orders/mkt_buy_aapl.json
-```
-
-Place:
-
-```bash
 python -m src.app place --json-file examples/orders/mkt_buy_aapl.json
-python -m src.app place --json-file examples/orders/mkt_buy_aapl.json --transmit
 python -m src.app place --json-file examples/orders/mkt_buy_aapl.json --dry-run
-```
-
-Watch:
-
-```bash
 python -m src.app watch --order-id 123
-python -m src.app watch --order-id 123 --poll-interval 0.5 --max-wait 120
 ```
 
-Behavior:
-- `watch` exits `0` when a terminal state is reached.
-- Terminal states include: `FILLED`, `CANCELLED`, `ApiCancelled` variants, `INACTIVE`.
-
-## 4) Persistence Model
+## 6) Persistence
 
 Order state is persisted to SQLite at `ORDER_DB_PATH` (default `data/orders.db`).
 
-Stored fields include:
-- `order_id`
-- `status`
-- `filled`
-- `avg_fill_price`
-- `symbol`
-- `action`
-- `order_type`
-- `quantity`
-- `limit_price`
-- `tif`
-- `transmit`
-- `order_ref`
-- `last_error_code`
-- `last_error`
-- `perm_id`
-- `last_update`
-- `raw_state`
+Persisted data includes status/fill/error fields and full `raw_state`, enabling watch/recovery across process restarts.
 
-This allows `watch` and readbacks to work across process restarts.
+## 7) Error Contract
 
-## 5) Error Handling Contract
+Common cases:
+- Validation failure:
+  - `TradeResult.ok=False`
+  - `TradeResult.errors=[...]`
+- TWS unavailable/maintenance:
+  - `TradeResult.ok=False`
+  - `TradeResult.error="could not connect to TWS"`
+- Watch timeout:
+  - `TradeResult.ok=False`
+  - `TradeResult.error="max_wait_exceeded"`
 
-Validation errors:
-- Returned as `errors: list[dict]` in `ValidateOut`/`PlaceOut`
-- CLI returns JSON with `valid=false` or `submitted=false`
+## 8) Recommended Usage Rule
 
-Connection errors (TWS unavailable/maintenance):
-- `run_health`: `connected=false`, `error="could not connect to TWS"`
-- `run_place`: `submitted=false`, `error="could not connect to TWS"`
-- `run_watch`: `terminal=false`, `error="could not connect to TWS"`
+If backend and trade logic are deployed together, use only:
 
-Runtime exceptions:
-- Returned as `errors=[{"type":"runtime","msg":"..."}]` where applicable.
+- `TradeRequest` (optional typed wrapper)
+- `execute_trade`
+- `TradeResult`
 
-## 6) Integration Pattern (Backend -> Library)
-
-Recommended architecture when in same deployable:
-- Backend imports `run_validate`, `run_place`, `run_watch` directly.
-- Backend passes dict payloads from its own request layer.
-- Backend handles retries/timeouts at orchestration layer.
-- Backend uses `on_update` callback in `run_watch` to push events (logs, SSE, websockets, queue).
-
-Minimal facade example:
-
-```python
-from src.service_api import PlaceIn, ValidateIn, WatchIn, run_place, run_validate, run_watch
-
-def submit_order(order_payload: dict, transmit: bool = False):
-    v = run_validate(ValidateIn(order=order_payload, transmit=transmit))
-    if not v.valid:
-        return {"ok": False, "errors": v.errors}
-
-    p = run_place(PlaceIn(order=order_payload, transmit=transmit))
-    if not p.submitted:
-        return {"ok": False, "error": p.error, "errors": p.errors}
-
-    return {"ok": True, "order_id": p.order_id, "state": p.state}
-```
-
-## 7) Operational Notes
-
-- This project is for IBKR paper trading basic orders (`STK`, `MKT/LMT`) at current scope.
-- `transmit=false` default is intentional safety.
-- If TWS is under maintenance or not listening on the configured port, expect connection error `502`.
-- For TWS paper account, default port is usually `7497`.
-
-## 8) Stability and Compatibility
-
-Public API surface for backend use:
-- `src/service_api.py` function signatures and dataclasses
-- `src/domain/order_request.py` schema
-
-Internal implementation details (IB callbacks, store internals) may evolve.
+Treat all lower-level modules as implementation details unless you need custom orchestration.
