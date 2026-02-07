@@ -1,0 +1,8 @@
+{
+  "action": "BUY",
+  "symbol": "AAPL",
+  "order_type": "MKT",
+  "quantity": 1,
+  "transmit": false,
+  "client_tag": "demo-mkt-001"
+}

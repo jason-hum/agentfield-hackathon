@@ -1,0 +1,12 @@
+{
+  "action": "SELL",
+  "symbol": "MSFT",
+  "order_type": "LMT",
+  "quantity": 2,
+  "limit_price": 450.0,
+  "tif": "DAY",
+  "exchange": "SMART",
+  "currency": "USD",
+  "transmit": false,
+  "order_ref": "demo-lmt-001"
+}
